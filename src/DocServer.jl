@@ -21,7 +21,7 @@ function Selectors.runner(::Type{LiveBlocks}, x, page, doc)
     matched === nothing && error("invalid '@live' syntax: $(x.language)")
     # The sandboxed module -- either a new one or a cached one from this page.
 
-    key = page.source
+    key = replace(page.source, "/", ":")
     name = matched[1]
     sym  = isempty(name) ? gensym("live-") : Symbol("live-", name)
     mod  = get!(page.globals.meta, sym, Module(sym))::Module
@@ -33,9 +33,10 @@ function Selectors.runner(::Type{LiveBlocks}, x, page, doc)
     end
     push!(live_blocks[key], (page, doc, mod, input))
 
-    id = "$key/live-$(length(live_blocks[key]))"
+    id = "live-$(length(live_blocks[key]))"
     scr = """
-    <script>alert("liveblock $id")</script>
+    <div id="$id">live output $id</div>
+    <script>loadliveblocks($(JSON.json(key)))</script>
     """
     output = Documents.RawHTML(scr)
 
@@ -52,32 +53,58 @@ Adds the document to the Mux app
 abstract type ServeDocument <: DocumentPipeline end
 Selectors.order(::Type{ServeDocument}) = typemax(Float64) - π
 
-"""
-Adds the document to the Mux app
-"""
-abstract type InsertWebIO <: DocumentPipeline end
-Selectors.order(::Type{InsertWebIO}) = 2.5
+function htmlrender(m::Union{MIME"text/html",
+                            MIME"text/plain",
+                            MIME"text/svg"}, x)
+    stringmime(m, x)
+end
 
-function Selectors.runner(::Type{InsertWebIO}, doc::Documents.Document)
-   #for (src, p) in doc.internal.pages
-   #    key = p.source
-   #    #s = Markdown.MD([Documents.RawHTML("<script>alert('init $key')</script>")])
-   #    #p.mapping[s] = s
-   #    #unshift!(p.elements, s)
-   #    @show p.elements
-   #    s = Markdown.MD([Documents.RawHTML("<script>alert('fin $key')</script>")])
-   #    push!(p.elements, s)
-   #    p.mapping[s] = s
-   #end
+function htmlrender(m::Union{MIME"image/png", MIME"image/jpeg"})
+    "<img src=\"data:image/png;base64,$(stringmime(m, img))\">"
+end
+
+const bestmimes = MIME.(["text/html", "text/svg", "image/png", "image/jpeg"])
+
+function htmlrender(x)
+    for m in bestmimes
+        if mimewritable(m, x)
+            return htmlrender(m, x)
+       end
+    end
+    return string(x)
 end
 
 function server(req)
-    @show req
-    key = req.params[:key]
-    @show key
-    if haskey(liveblocks, key)
-        "yes!"
+    key = req[:params][:key]
+    @show keys(live_blocks) |> collect
+    if haskey(live_blocks, key)
+        blocks = []
+        for (page, doc, mod, input) in live_blocks[key]
+            result = nothing
+            for (ex, str) in Utilities.parseblock(input, doc, page)
+                (value, success, backtrace, text) = Utilities.withoutput() do
+                    cd(dirname(page.build)) do
+                        eval(mod, ex)
+                    end
+                end
+                result = value
+                if !success
+                    Utilities.warn(page.source, "failed to run code block.\n\n$(value)")
+                    return
+                end
+            end
+            push!(blocks, htmlrender(result))
+        end
+
+        return Dict(
+                    :headers => Dict("Content-Type" => "text/json"),
+                    :body => JSON.json(blocks)
+                   )
     end
+    return Dict(
+                :headers => Dict("Content-Type"=> "text/json"),
+                :body => ""
+               )
 end
 
 include(Pkg.dir("WebIO", "src", "providers", "mux_setup.jl"))
